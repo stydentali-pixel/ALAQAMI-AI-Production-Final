@@ -1,0 +1,66 @@
+// Reference schema — NOT currently wired up to Prisma.
+// ------------------------------------------------------------------------
+// The running application currently persists this exact shape through
+// `src/lib/db/jsonStore.ts` (a dependency-free, file-backed JSON store) —
+// see the architectural summary in README.md for why.
+//
+// This file documents the intended production schema so migrating to a
+// real database is a mechanical exercise:
+//   1. `bun add prisma @prisma/client && bunx prisma init`
+//   2. Copy this file to `prisma/schema.prisma`, set `provider` and `url`
+//      for your target database (Postgres recommended for multi-instance
+//      deployments).
+//   3. `bunx prisma migrate dev --name init`
+//   4. Reimplement `src/lib/db/jsonStore.ts`'s `collection()` calls using
+//      `prisma.user.*` / `prisma.session.*` / `prisma.providerConfig.*` —
+//      the repositories in `src/lib/db/providerConfigRepo.ts` and
+//      `src/lib/security/auth.ts` were written against a small enough
+//      surface (`list/find/filter/insert/update/remove`) that this is a
+//      contained, mechanical swap.
+
+datasource db {
+  provider = "postgresql" // or "sqlite" for single-instance deployments
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id            String           @id @default(uuid())
+  email         String           @unique
+  passwordHash  String
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  sessions      Session[]
+  providerConfigs ProviderConfig[]
+}
+
+model Session {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model ProviderConfig {
+  id              String   @id @default(uuid())
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider        String
+  apiKeyEncrypted String? // AES-256-GCM ciphertext, base64 — never plaintext
+  baseURL         String?
+  enabled         Boolean  @default(true)
+  defaultModel    String?
+  customHeaders   Json?
+  organization    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([userId, provider])
+  @@index([userId])
+}
