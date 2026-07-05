@@ -14,6 +14,7 @@ import {
   resolveProviderConfig,
   type ProviderMode,
 } from "@/lib/providers/manager";
+import { recordUsage } from "@/lib/db/usageStatsRepo";
 
 // NOTE: this route now runs on the Node.js runtime rather than "edge".
 // Mode 2 (server-side encrypted provider storage) needs `node:crypto` to
@@ -94,7 +95,7 @@ export async function POST(req: NextRequest) {
   // Resolve credentials via the Unified Provider Manager. Only look up the
   // session when server-side mode is actually requested — BYOK requests
   // (the default, and all pre-existing traffic) never touch auth or the DB.
-  const user = mode === "server" ? await getSessionUser(req) : null; console.log("DEBUG: mode", mode, "user", user);
+  const user = mode === "server" ? await getSessionUser(req) : null;
 
   let resolved;
   try {
@@ -218,8 +219,23 @@ export async function POST(req: NextRequest) {
       const reader = upstream!.body!.getReader();
       let buffer = "";
 
+      // Accumulate token usage across the stream so we can persist a single
+      // aggregated usage record when the response completes (server mode only).
+      let promptTokens = 0;
+      let completionTokens = 0;
+
       const send = (obj: Record<string, unknown>) => {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      };
+
+      const accumulateUsage = (usage: {
+        promptTokens?: number;
+        completionTokens?: number;
+      }) => {
+        if (typeof usage.promptTokens === "number") promptTokens = usage.promptTokens;
+        if (typeof usage.completionTokens === "number") {
+          completionTokens = usage.completionTokens;
+        }
       };
 
       try {
@@ -253,6 +269,7 @@ export async function POST(req: NextRequest) {
                   send({ text: parsed.text });
                 }
                 if (parsed.usage) {
+                  accumulateUsage(parsed.usage);
                   send({ usage: parsed.usage });
                 }
                 if (parsed.done) {
@@ -277,7 +294,10 @@ export async function POST(req: NextRequest) {
               const parsed = parseChunk(requestInit.protocol, json);
               if (parsed.text) send({ text: parsed.text });
               if (parsed.done) send({ done: true });
-              if (parsed.usage) send({ usage: parsed.usage });
+              if (parsed.usage) {
+                accumulateUsage(parsed.usage);
+                send({ usage: parsed.usage });
+              }
             } catch {
               /* ignore */
             }
@@ -288,6 +308,17 @@ export async function POST(req: NextRequest) {
         send({ error: e?.message || "Stream interrupted" });
       } finally {
         controller.close();
+        // Persist aggregated usage for authenticated, server-mode requests.
+        // Best-effort: never affects the streamed response to the client.
+        if (user && (promptTokens > 0 || completionTokens > 0)) {
+          void recordUsage({
+            userId: user.id,
+            provider: providerId,
+            model,
+            promptTokens,
+            completionTokens,
+          });
+        }
       }
     },
     cancel() {

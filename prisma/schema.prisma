@@ -1,0 +1,208 @@
+// ALAQAMI AI — production database schema (Supabase PostgreSQL + Prisma)
+// ---------------------------------------------------------------------------
+// This is the source of truth for the application's persistence layer. It
+// replaces the previous file-backed JSON store. All repositories in
+// `src/lib/db/*` and `src/lib/security/auth.ts` are implemented against the
+// Prisma Client generated from this schema.
+//
+// Connection:
+//   - DATABASE_URL : pooled/primary connection used at runtime
+//   - DIRECT_URL   : direct connection used for migrations
+//
+// Conventions: model fields are camelCase in code and mapped to snake_case
+// columns / tables in Postgres via @map / @@map.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Users & auth
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  sessions        Session[]
+  providerConfigs ProviderConfig[]
+  chatSessions    ChatSession[]
+  preferences     UserPreferences?
+  auditLogs       AuditLog[]
+  apiKeys         ApiKey[]
+  usageStats      UsageStatistic[]
+
+  @@map("users")
+}
+
+model Session {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+// ---------------------------------------------------------------------------
+// Provider configurations (encrypted BYOK credentials, server-side storage)
+// ---------------------------------------------------------------------------
+
+model ProviderConfig {
+  id              String   @id @default(uuid())
+  userId          String   @map("user_id")
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider        String
+  apiKeyEncrypted String?  @map("api_key_encrypted") // AES-256-GCM ciphertext (base64) — never plaintext
+  baseURL         String?  @map("base_url")
+  enabled         Boolean  @default(true)
+  defaultModel    String?  @map("default_model")
+  customHeaders   Json?    @map("custom_headers")
+  organization    String?
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, provider])
+  @@index([userId])
+  @@map("provider_configs")
+}
+
+// ---------------------------------------------------------------------------
+// Chat history
+// ---------------------------------------------------------------------------
+
+model ChatSession {
+  id           String   @id @default(uuid())
+  userId       String   @map("user_id")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title        String   @default("New conversation")
+  providerId   String?  @map("provider_id")
+  model        String?
+  systemPrompt String?  @map("system_prompt")
+  parameters   Json?
+  pinned       Boolean  @default(false)
+  favorite     Boolean  @default(false)
+  folderId     String?  @map("folder_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  messages ChatMessage[]
+
+  @@index([userId])
+  @@index([userId, updatedAt])
+  @@map("chat_sessions")
+}
+
+model ChatMessage {
+  id            String      @id @default(uuid())
+  sessionId     String      @map("session_id")
+  session       ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  role          String // "system" | "user" | "assistant"
+  content       String
+  model         String?
+  providerId    String?     @map("provider_id")
+  promptTokens  Int?        @map("prompt_tokens")
+  completionTokens Int?     @map("completion_tokens")
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  @@index([sessionId])
+  @@index([sessionId, createdAt])
+  @@map("chat_messages")
+}
+
+// ---------------------------------------------------------------------------
+// User preferences (1:1 with user)
+// ---------------------------------------------------------------------------
+
+model UserPreferences {
+  id                String   @id @default(uuid())
+  userId            String   @unique @map("user_id")
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  language          String   @default("en")
+  theme             String   @default("system")
+  defaultProvider   String?  @map("default_provider")
+  defaultModel      String?  @map("default_model")
+  fallbackProvider  String?  @map("fallback_provider")
+  fallbackModel     String?  @map("fallback_model")
+  defaultParameters Json?    @map("default_parameters")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@map("user_preferences")
+}
+
+// ---------------------------------------------------------------------------
+// Audit logs (security events, best-effort)
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?  @map("user_id")
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String
+  ip        String?
+  userAgent String?  @map("user_agent")
+  metadata  Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Programmatic API keys (hashed at rest)
+// ---------------------------------------------------------------------------
+
+model ApiKey {
+  id         String    @id @default(uuid())
+  userId     String    @map("user_id")
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  keyHash    String    @unique @map("key_hash") // SHA-256 of the raw key — raw key shown once, never stored
+  prefix     String // first chars for display, e.g. "alq_ab12"
+  lastUsedAt DateTime? @map("last_used_at")
+  revoked    Boolean   @default(false)
+  createdAt  DateTime  @default(now()) @map("created_at")
+  updatedAt  DateTime  @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@map("api_keys")
+}
+
+// ---------------------------------------------------------------------------
+// Usage statistics (per user / provider / model / day)
+// ---------------------------------------------------------------------------
+
+model UsageStatistic {
+  id               String   @id @default(uuid())
+  userId           String   @map("user_id")
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider         String
+  model            String
+  day              DateTime @db.Date
+  promptTokens     Int      @default(0) @map("prompt_tokens")
+  completionTokens Int      @default(0) @map("completion_tokens")
+  totalTokens      Int      @default(0) @map("total_tokens")
+  requestCount     Int      @default(0) @map("request_count")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, provider, model, day])
+  @@index([userId])
+  @@index([userId, day])
+  @@map("usage_statistics")
+}

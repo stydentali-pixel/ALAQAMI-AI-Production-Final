@@ -3,6 +3,7 @@ import { apiError, apiOk, withApiErrorHandling } from "@/lib/api/response";
 import { checkBodySize } from "@/lib/api/guard";
 import { createSession, sessionCookieOptions, SESSION_COOKIE, verifyCredentials } from "@/lib/security/auth";
 import { getClientIp, rateLimit } from "@/lib/security/rateLimit";
+import { recordAudit } from "@/lib/db/auditLogRepo";
 
 export const runtime = "nodejs";
 
@@ -36,11 +37,22 @@ export const POST = withApiErrorHandling(async (req: NextRequest) => {
 
   const user = await verifyCredentials(body.email, body.password);
   if (!user) {
+    await recordAudit({
+      action: "auth.login.failed",
+      ip: getClientIp(req),
+      userAgent: req.headers.get("user-agent"),
+    });
     // Deliberately generic — never reveal whether the email exists.
     return apiError("Invalid email or password", 401);
   }
 
   const session = await createSession(user.id);
+  await recordAudit({
+    action: "auth.login.success",
+    userId: user.id,
+    ip: getClientIp(req),
+    userAgent: req.headers.get("user-agent"),
+  });
   const res = apiOk({ id: user.id, email: user.email });
   res.cookies.set(SESSION_COOKIE, session.id, {
     ...sessionCookieOptions,
