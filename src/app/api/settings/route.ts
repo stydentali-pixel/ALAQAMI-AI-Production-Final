@@ -11,7 +11,8 @@ import {
   type ProviderConfigInput,
 } from "@/lib/db/providerConfigRepo";
 import { isValidProviderId } from "@/lib/providers/catalog";
-import { rateLimit } from "@/lib/security/rateLimit";
+import { getClientIp, rateLimit } from "@/lib/security/rateLimit";
+import { recordAudit } from "@/lib/db/auditLogRepo";
 
 export const runtime = "nodejs";
 
@@ -94,6 +95,13 @@ export const POST = withApiErrorHandling(async (req: NextRequest) => {
   if (validationError) return apiError(validationError, 400);
 
   const config = await upsertProviderConfig(user.id, body as ProviderConfigInput);
+  await recordAudit({
+    action: "provider.config.upsert",
+    userId: user.id,
+    ip: getClientIp(req),
+    userAgent: req.headers.get("user-agent"),
+    metadata: { provider: body.provider },
+  });
   return apiOk({ config }, 201);
 });
 
@@ -121,6 +129,13 @@ export const PATCH = withApiErrorHandling(async (req: NextRequest) => {
   const { id, ...patch } = body;
   const config = await patchProviderConfig(user.id, id, patch);
   if (!config) return apiError("Provider config not found", 404);
+  await recordAudit({
+    action: "provider.config.patch",
+    userId: user.id,
+    ip: getClientIp(req),
+    userAgent: req.headers.get("user-agent"),
+    metadata: { id },
+  });
   return apiOk({ config });
 });
 
@@ -136,5 +151,12 @@ export const DELETE = withApiErrorHandling(async (req: NextRequest) => {
 
   const removed = await deleteProviderConfig(user.id, id);
   if (!removed) return apiError("Provider config not found", 404);
+  await recordAudit({
+    action: "provider.config.delete",
+    userId: user.id,
+    ip: getClientIp(req),
+    userAgent: req.headers.get("user-agent"),
+    metadata: { id },
+  });
   return apiOk({ deleted: true });
 });

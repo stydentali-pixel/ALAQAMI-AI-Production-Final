@@ -3,6 +3,7 @@ import { apiError, apiOk, withApiErrorHandling } from "@/lib/api/response";
 import { checkBodySize } from "@/lib/api/guard";
 import { createSession, createUser, sessionCookieOptions, SESSION_COOKIE } from "@/lib/security/auth";
 import { getClientIp, rateLimit } from "@/lib/security/rateLimit";
+import { recordAudit } from "@/lib/db/auditLogRepo";
 
 export const runtime = "nodejs";
 
@@ -43,8 +44,24 @@ export const POST = withApiErrorHandling(async (req: NextRequest) => {
   const validationError = validate(body);
   if (validationError) return apiError(validationError, 400);
 
-  const user = await createUser(body.email!.trim(), body.password!);
+  let user;
+  try {
+    user = await createUser(body.email!.trim(), body.password!);
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : "";
+    // Duplicate email (pre-check or DB unique-constraint race, Prisma P2002).
+    if (message.includes("already exists") || (e as { code?: string })?.code === "P2002") {
+      return apiError("An account with this email already exists", 409);
+    }
+    throw e;
+  }
   const session = await createSession(user.id);
+  await recordAudit({
+    action: "auth.register",
+    userId: user.id,
+    ip: getClientIp(req),
+    userAgent: req.headers.get("user-agent"),
+  });
 
   const res = apiOk({ id: user.id, email: user.email }, 201);
   res.cookies.set(SESSION_COOKIE, session.id, {

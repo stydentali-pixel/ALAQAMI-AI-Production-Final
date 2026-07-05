@@ -1,6 +1,7 @@
-import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { NextRequest } from "next/server";
-import { collection, pruneExpiredSessions, type UserRecord } from "@/lib/db/jsonStore";
+import type { User } from "@prisma/client";
+import { prisma } from "@/lib/db/prisma";
 
 /**
  * Auth
@@ -11,11 +12,12 @@ import { collection, pruneExpiredSessions, type UserRecord } from "@/lib/db/json
  * decrypted provider API keys.
  *
  * Cookie carries only a random session id; all session state (user, expiry)
- * lives server-side in the database. This is intentionally the simplest
- * viable "Authenticated Backend" for the Mode 2 (server-side encrypted
- * storage) flow described in the brief. Swapping in a full-featured auth
- * provider (OAuth, magic links, 2FA) later is additive — the `getSessionUser`
- * contract below is the only thing other modules depend on.
+ * lives server-side in the database (Supabase PostgreSQL via Prisma). This is
+ * intentionally the simplest viable "Authenticated Backend" for the Mode 2
+ * (server-side encrypted storage) flow described in the brief. Swapping in a
+ * full-featured auth provider (OAuth, magic links, 2FA) later is additive —
+ * the `getSessionUser` contract below is the only thing other modules depend
+ * on.
  */
 
 export const SESSION_COOKIE = "alaqami_session";
@@ -25,6 +27,9 @@ export interface SessionUser {
   id: string;
   email: string;
 }
+
+/** Re-exported for callers that previously depended on the JSON store's record shape. */
+export type UserRecord = User;
 
 function hashPassword(password: string, salt: string): string {
   return scryptSync(password, salt, 64).toString("hex");
@@ -46,24 +51,22 @@ export function verifyPasswordHash(password: string, stored: string): boolean {
   return timingSafeEqual(a, b);
 }
 
-export async function findUserByEmail(email: string): Promise<UserRecord | undefined> {
-  return collection("users").find((u) => u.email.toLowerCase() === email.toLowerCase());
+export async function findUserByEmail(email: string): Promise<User | null> {
+  return prisma.user.findUnique({ where: { email: email.toLowerCase().trim() } });
 }
 
-export async function createUser(email: string, password: string): Promise<UserRecord> {
-  const existing = await findUserByEmail(email);
+export async function createUser(email: string, password: string): Promise<User> {
+  const normalizedEmail = email.toLowerCase().trim();
+  const existing = await findUserByEmail(normalizedEmail);
   if (existing) {
     throw new Error("An account with this email already exists");
   }
-  const now = new Date().toISOString();
-  const user: UserRecord = {
-    id: randomUUID(),
-    email: email.toLowerCase().trim(),
-    passwordHash: createPasswordHash(password),
-    createdAt: now,
-    updatedAt: now,
-  };
-  return collection("users").insert(user);
+  return prisma.user.create({
+    data: {
+      email: normalizedEmail,
+      passwordHash: createPasswordHash(password),
+    },
+  });
 }
 
 // Fixed-cost dummy hash used to equalize response time when the account
@@ -73,7 +76,7 @@ const DUMMY_HASH = createPasswordHash("dummy-password-for-timing-equalization");
 export async function verifyCredentials(
   email: string,
   password: string,
-): Promise<UserRecord | null> {
+): Promise<User | null> {
   const user = await findUserByEmail(email);
   if (!user) {
     verifyPasswordHash(password, DUMMY_HASH); // burn equivalent CPU time, then fail
@@ -85,19 +88,22 @@ export async function verifyCredentials(
 
 export async function createSession(userId: string): Promise<{ id: string; expiresAt: string }> {
   await pruneExpiredSessions();
-  const id = randomUUID();
-  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  await collection("sessions").insert({
-    id,
-    userId,
-    expiresAt,
-    createdAt: new Date().toISOString(),
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+  const session = await prisma.session.create({
+    data: { userId, expiresAt },
   });
-  return { id, expiresAt };
+  return { id: session.id, expiresAt: session.expiresAt.toISOString() };
 }
 
 export async function destroySession(sessionId: string): Promise<void> {
-  await collection("sessions").remove((s) => s.id === sessionId);
+  // deleteMany never throws on a missing row (unlike delete), so logout is
+  // idempotent even if the session was already pruned/expired.
+  await prisma.session.deleteMany({ where: { id: sessionId } });
+}
+
+/** Removes expired sessions. Safe to call opportunistically on login/session checks. */
+export async function pruneExpiredSessions(): Promise<void> {
+  await prisma.session.deleteMany({ where: { expiresAt: { lt: new Date() } } });
 }
 
 /** Resolves the authenticated user (if any) from the session cookie on a request. */
@@ -105,23 +111,23 @@ export async function getSessionUser(req: NextRequest): Promise<SessionUser | nu
   const sessionId = req.cookies.get(SESSION_COOKIE)?.value;
   if (!sessionId) return null;
 
-  const session = await collection("sessions").find((s) => s.id === sessionId);
+  const session = await prisma.session.findUnique({
+    where: { id: sessionId },
+    include: { user: true },
+  });
   if (!session) return null;
-  if (new Date(session.expiresAt).getTime() < Date.now()) {
+  if (session.expiresAt.getTime() < Date.now()) {
     await destroySession(sessionId);
     return null;
   }
 
-  const user = await collection("users").find((u) => u.id === session.userId);
-  if (!user) return null;
-
-  return { id: user.id, email: user.email };
+  return { id: session.user.id, email: session.user.email };
 }
 
 /** Cookie options shared by login/register (set) and logout (clear). */
 export const sessionCookieOptions = {
   httpOnly: true,
-  secure: false,
+  secure: process.env.NODE_ENV === "production",
   sameSite: "lax" as const,
   path: "/",
 };
